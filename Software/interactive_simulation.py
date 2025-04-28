@@ -8,14 +8,16 @@ import time
 
 # ========== CONFIG ==========
 USE_SIMULATION = True
-sample_rate_hz = 10000  # Simulated sample rate: 10kHz
-serial_port = "COM3"    # Ignored in simulation mode
+sample_rate_hz = 10000
+serial_port = "COM3"
 baud_rate = 115200
 
-PACKET_SIZE = 2054  # 2 header + 2048 ADC + 2 gain + 2 trigger
+PACKET_SIZE = 2054
 SAMPLES = 1024
+zoom_value = 2.0  # Initial default zoom
+manual_trigger_level = 1.7  # in Volts
 
-# ========== GLOBALS ==========
+# ========== GLOBAL STATE ==========
 global_data = {
     'adc': None,
     'gain': None,
@@ -23,46 +25,40 @@ global_data = {
 }
 data_lock = threading.Lock()
 sim_phase = 0
-zoom_value = 4  # Default zoom (1x)
 
-# ========== GET ZOOM FACTOR (Option 4: from variable) ==========
+# ========== ZOOM LOGIC ==========
 def get_zoom_factor():
-    """
-    Replace this function to read from a potentiometer or ADC input.
-    For now, manually adjust `zoom_value` below for testing.
-
-    Later, replace get_zoom_factor() with a value from a potentiometer input (e.g., analogRead() mapped to 0.5–4.0 range from your microcontroller).
-    """
     return zoom_value
 
-
-
-# ========== SIMULATION ==========
+# ========== SIMULATED PACKET GENERATOR ==========
 def simulate_packet():
-    """Generates a pulse waveform and packs it into a simulated packet."""
-    global sim_phase
+    global sim_phase, zoom_value
     t = np.linspace(0, 1, SAMPLES)
-
-    # Create pulse waveform
     freq = 5
-    pulse_wave = (np.sin(2 * np.pi * freq * t + sim_phase) > 0).astype(np.int16)
-    amplitude = 30000
-    waveform = pulse_wave * amplitude
-
+    pulse = (np.sin(2 * np.pi * freq * t + sim_phase) > 0).astype(np.int16)
+    amplitude = 28000
     noise = np.random.normal(0, 500, SAMPLES)
-    waveform = waveform + noise
+
+    simulated_zoom_adc = 2700
+    zoom_voltage = (simulated_zoom_adc / 4095.0) * 3.3
+    zoom_mapped = np.interp(zoom_voltage, [1.7, 3.3], [0.5, 5.0])
+    zoom_value = zoom_mapped
+
+    offset_voltage = np.random.choice([2.0, 4.0, 6.0, 8.0])
+    offset_adc = int((offset_voltage / 10.0) * 32767)
+    waveform = pulse * amplitude + offset_adc + noise
     waveform = np.clip(waveform, 0, 32767).astype(np.int16)
 
-    sim_phase += 0.2
+    sim_phase += 0.3
 
     adc_bytes = b''.join(struct.pack('<H', val) for val in waveform)
     header = bytes([0xAA, 0x55])
-    gain_bytes = struct.pack('<H', np.random.randint(1, 20))
-    trigger_bytes = struct.pack('<H', np.random.randint(2000, 3000))
+    gain_bytes = struct.pack('<H', np.random.randint(1, 10))
+    trigger_bytes = struct.pack('<H', 0)  # Unused now
 
     return header + adc_bytes + gain_bytes + trigger_bytes
 
-# ========== DATA READER ==========
+# ========== READ PACKETS ==========
 def read_serial_packets():
     while True:
         if USE_SIMULATION:
@@ -79,58 +75,85 @@ def read_serial_packets():
                 print("Serial error:", e)
                 continue
 
-        # Parse packet
         if packet[0] != 0xAA or packet[1] != 0x55:
-            print("Header mismatch, skipping packet.")
             continue
 
         adc_bytes = packet[2:2050]
         adc_data = np.frombuffer(adc_bytes, dtype='<H')
-
         gain = struct.unpack('<H', packet[2050:2052])[0]
-        trigger = struct.unpack('<H', packet[2052:2054])[0]
 
         with data_lock:
             global_data['adc'] = adc_data
             global_data['gain'] = gain
-            global_data['trigger'] = trigger
 
-# ========== START THREAD ==========
-reader_thread = threading.Thread(target=read_serial_packets, daemon=True)
-reader_thread.start()
+# ========== START READER THREAD ==========
+threading.Thread(target=read_serial_packets, daemon=True).start()
 
 # ========== PLOTTING ==========
 plt.ion()
 fig, ax = plt.subplots()
-line, = ax.plot(np.zeros(SAMPLES))
+line, = ax.plot(np.zeros(SAMPLES), label="Signal")
+trigger_line = ax.axhline(manual_trigger_level, color='r', linestyle='--', label='Trigger Level')
 ax.set_ylim(0, 10)
 ax.set_xlabel("Time (ms)")
 ax.set_ylabel("Voltage (V)")
-ax.set_title("Real-Time Pulse Waveform")
+ax.set_title("Real-Time Pulse with Trigger")
+ax.legend()
+
+# ========== KEYBOARD SHORTCUT ==========
+def on_key(event):
+    global manual_trigger_level
+    if event.key == 'up':
+        manual_trigger_level = min(manual_trigger_level + 0.1, 10.0)
+        print(f"Trigger level increased to {manual_trigger_level:.2f} V")
+    elif event.key == 'down':
+        manual_trigger_level = max(manual_trigger_level - 0.1, 0.0)
+        print(f"Trigger level decreased to {manual_trigger_level:.2f} V")
+    trigger_line.set_ydata([manual_trigger_level, manual_trigger_level])
+    fig.canvas.draw()
+
+fig.canvas.mpl_connect('key_press_event', on_key)
 
 # ========== MAIN LOOP ==========
 while True:
     with data_lock:
         adc_data = global_data['adc']
         gain = global_data['gain']
-        trigger = global_data['trigger']
 
     if adc_data is not None:
         voltage_data = (adc_data.astype(np.float64) / 32767.0) * 10.0
+        trigger_voltage = manual_trigger_level
 
-        # Get dynamic zoom factor
-        zoom_factor = get_zoom_factor()
-        visible_samples = int(SAMPLES / zoom_factor)
-        visible_samples = max(10, min(visible_samples, SAMPLES))
+        trigger_index = None
+        for i in range(1, len(voltage_data)):
+            if voltage_data[i - 1] < trigger_voltage <= voltage_data[i]:
+                trigger_index = i
+                break
 
-        time_axis = np.arange(visible_samples) * (1000.0 / sample_rate_hz)
-        voltage_view = voltage_data[:visible_samples]
+        if trigger_index is not None:
+            zoom_factor = get_zoom_factor()
+            visible_samples = int(SAMPLES / zoom_factor)
+            visible_samples = max(10, min(visible_samples, SAMPLES))
 
-        line.set_data(time_axis, voltage_view)
-        ax.set_xlim(time_axis[0], time_axis[-1])
-        fig.canvas.draw()
-        fig.canvas.flush_events()
+            end_index = trigger_index + visible_samples
+            if end_index > SAMPLES:
+                end_index = SAMPLES
+                trigger_index = end_index - visible_samples
 
-        print(f"Gain: {gain}, Trigger: {trigger}, Zoom: {zoom_factor:.2f}x")
+            time_axis = np.arange(visible_samples) * (1000.0 / sample_rate_hz)
+            voltage_view = voltage_data[trigger_index:end_index]
+
+            line.set_data(time_axis, voltage_view)
+            trigger_line.set_ydata([trigger_voltage, trigger_voltage])
+            ax.set_xlim(time_axis[0], time_axis[-1])
+
+            fig.canvas.draw()
+            fig.canvas.flush_events()
+            #print(f"Gain: {gain}, Trigger: {trigger_voltage:.2f} V, Zoom: {zoom_factor:.2f}x")
+            print(voltage_data)
+            print(f"Trigger: {trigger_index:.2f}")
+        else:
+            #print("Waiting for trigger...")
+            print()
 
     plt.pause(0.1)
