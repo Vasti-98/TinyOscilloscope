@@ -59,3 +59,25 @@ int main(void) {
         HAL_Delay(100); // Adjust to your sample rate
     }
 }
+
+"""
+uint16_t read_adc_channel(uint32_t channel) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = 1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_2CYCLES_5;
+    HAL_ADC_ConfigChannel(&hadc1, &sConfig);
+
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, HAL_MAX_DELAY);
+    uint16_t val = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+
+    return val;
+}
+
+void update_gain_and_trigger() {
+    gain_value = read_adc_channel(ADC_CHANNEL_5);     // e.g., potentiometer for gain
+    trigger_value = read_adc_channel(ADC_CHANNEL_6);  // e.g., potentiometer for trigger
+}
+"""
